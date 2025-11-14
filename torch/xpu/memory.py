@@ -1,8 +1,9 @@
 import collections
-from typing import Any, Union
+from typing import Any, Union, Optional
 
 import torch
 from torch.types import Device
+from torch._utils import _dummy_type
 
 from . import _get_device_index, _lazy_init, is_initialized
 
@@ -253,4 +254,60 @@ __all__ = [
     "reset_accumulated_memory_stats",
     "reset_peak_memory_stats",
     "set_per_process_memory_fraction",
+    "MemPool",
 ]
+
+if not hasattr(torch._C, "_xpu_XPUAllocator"):
+    # Define dummy base classes
+    torch._C.__dict__["_xpu_XPUAllocator"] = _dummy_type("_xpu_XPUAllocator")
+
+
+if not hasattr(torch._C, "_XPUMemPool"):
+    # Define dummy base classes
+    torch._C.__dict__["_XPUMemPool"] = _dummy_type("_XPUMemPool")
+
+from torch._C import (  # noqa: F401
+    _xpu_XPUAllocator,
+    _XPUMemPool,
+)
+
+class MemPool(_XPUMemPool):
+    r"""MemPool represents a pool of memory in a caching allocator. Currently,
+    it's just the ID of the pool object maintained in the XPUCachingAllocator.
+
+    Args:
+        allocator(torch._C._xpu_XPUAllocator, optional): a
+            torch._C._xpu_XPUAllocator object that can be used to
+            define how memory gets allocated in the pool. If :attr:`allocator`
+            is ``None`` (default), memory allocation follows the default/
+            current configuration of the XPUCachingAllocator.
+        use_on_oom(bool): a bool that indicates if this pool can be used
+            as a last resort if a memory allocation outside of the pool fails due
+            to Out Of Memory. This is False by default.
+
+    """
+
+    def __init__(
+        self,
+        allocator: Optional[_xpu_XPUAllocator] = None,
+        use_on_oom: bool = False,
+    ):
+        super().__init__(allocator, True, use_on_oom)
+
+    @property
+    def id(self) -> tuple[int, int]:
+        r"""Returns the ID of this pool as a tuple of two ints."""
+        return super().id
+
+    @property
+    def allocator(self) -> Optional[_xpu_XPUAllocator]:
+        r"""Returns the allocator this MemPool routes allocations to."""
+        return super().allocator
+
+    def use_count(self) -> int:
+        r"""Returns the reference count of this pool."""
+        return super().use_count()
+
+    def snapshot(self):
+        # not supported yet
+        raise NotImplementedError("XPU: MemPool.snapshot is not supported yet.")
