@@ -1,10 +1,13 @@
 # Owner(s): ["module: intel"]
+# ruff: noqa: F841
 
 import collections
 import ctypes
+import contextlib
 import gc
 import json
 import random
+import os
 import re
 import subprocess
 import sys
@@ -26,6 +29,12 @@ from torch.testing._internal.common_device_type import (
     ops,
 )
 from torch.testing._internal.common_methods_invocations import ops_and_refs
+from torch.testing._internal.common_optimizers import (
+    _get_optim_inputs_including_global_cliquey_kwargs,
+    optim_db,
+    optims,
+    TensorTracker,
+)
 from torch.testing._internal.common_utils import (
     find_library_location,
     instantiate_parametrized_tests,
@@ -1378,6 +1387,30 @@ if __name__ == "__main__":
         g.reset()
         del g
 
+    def test_graph_debugdump(self):
+        torch.xpu.empty_cache()
+        x = torch.randn(10240000, device="xpu")
+        y = torch.rand_like(x)
+        g = torch.xpu.XPUGraph()
+        g.enable_debug_mode()
+        s0 = torch.xpu.Stream()
+        s1 = torch.xpu.Stream()
+        s0.wait_stream(torch.xpu.current_stream())
+        with torch.xpu.stream(s0):
+            g.capture_begin()
+            z = x + y
+            with torch.xpu.stream(s1):
+                s1.wait_stream(s0)
+                z + y
+            s0.wait_stream(s1)
+            g.capture_end()
+        s0.synchronize()
+        torch.xpu.synchronize()
+        with tempfile.TemporaryDirectory() as tempdir:
+            output_path = os.path.join(tempdir, "out_multi_stream.dot")
+            g.debug_dump(output_path)
+            self.assertTrue(os.path.exists(output_path), f"Debug dump file not found: {output_path}")
+
     @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
     def test_graph_warn_if_has_zero_nodes(self):
         with warnings.catch_warnings(record=True) as caught:
@@ -2298,7 +2331,6 @@ if __name__ == "__main__":
             ),
             (True, False),
         ):
-            print(optimizer.__name__, second_param_group_capturable)
             ref_p1, param1 = (
                 torch.nn.Parameter(torch.ones(1, device="xpu")) for _ in range(2)
             )
@@ -2349,6 +2381,487 @@ if __name__ == "__main__":
                     g.replay()
                 self.assertEqual(ref_p1, param1)
                 self.assertEqual(ref_p2, param2)
+
+    @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
+    def test_xpu_graph_error_options(self):
+        def fn():
+            x = torch.zeros([2000], device="xpu")
+            y = x + x + x
+            return y
+
+        mem = None
+
+        def raw_malloc():
+            global mem
+            mem = None
+            stream = torch.xpu.Stream()
+            try:
+                with torch.xpu.stream(stream):
+                    mem = torch.xpu.caching_allocator_alloc(1024)
+            except BaseException:  # noqa: B036
+                if mem is None:
+                    return
+            try:
+                torch.xpu.caching_allocator_delete(mem)
+                mem = None
+                return None
+            except BaseException:  # noqa: B036
+                pass
+
+        def throws_on_xpu_event():
+            graph = torch.xpu.XPUGraph()
+            torch.xpu.synchronize()
+            stream = torch.xpu.Stream()
+            stream.wait_stream(torch.xpu.current_stream())
+            with torch.xpu.stream(stream):
+                fn()
+            stream.synchronize()
+            torch.xpu.current_stream().wait_stream(stream)
+            torch.xpu.synchronize()
+            try:
+                with torch.xpu.graph(graph, stream=stream):
+                    out = fn()
+                    thread = threading.Thread(target=raw_malloc)
+                    thread.start()
+                    thread.join()
+            except Exception:
+                if mem is not None:
+                    torch.xpu.caching_allocator_delete(mem)
+                return True
+
+            return False
+
+        self.assertFalse(throws_on_xpu_event())
+
+    @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
+    def test_xpu_graph_raw_graph_keep_graph_false(self):
+        graph = torch.xpu.XPUGraph(keep_graph=False)
+        x = torch.zeros([2000], device="xpu")
+        y = torch.ones([2000], device="xpu")
+        with torch.xpu.graph(graph):
+            z = x + y
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"instantiate\(\) is intended to be called by the user only when keep_graph=true",
+        ):
+            raw_pointer = graph.instantiate()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"You cannot access the raw xpuGraph_t instance unless XPUGraph was initialized with keep_graph=true",
+        ):
+            raw_pointer = graph.raw_xpu_graph()
+
+    @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
+    def test_xpu_graph_raw_graph_reset_and_recapture(self):
+        graph = torch.xpu.XPUGraph(keep_graph=True)
+        x = torch.zeros([2000], device="xpu")
+        with torch.xpu.graph(graph):
+            x += 1.0
+
+        graph.instantiate()
+        graph.replay()
+        self.assertTrue(torch.all(x == 1.0))
+        graph.instantiate()
+        graph.replay()
+        self.assertTrue(torch.all(x == 2.0))
+        graph.replay()
+        self.assertTrue(torch.all(x == 3.0))
+
+        graph.reset()
+
+        x = torch.zeros([2000], device="xpu")
+        with torch.xpu.graph(graph):
+            x += 2.0
+
+        graph.instantiate()
+        graph.replay()
+        self.assertTrue(torch.all(x == 2.0))
+        graph.instantiate()
+        graph.replay()
+        self.assertTrue(torch.all(x == 4.0))
+        graph.replay()
+        self.assertTrue(torch.all(x == 6.0))
+
+    def test_xpu_graph_allocator_propagates_stream(self):
+        segments = torch.xpu.memory_snapshot()
+        existing_pools = {s["segment_pool_id"] for s in segments}
+        x = torch.randn(10240000, device="xpu")
+        y = torch.rand_like(x)
+        g = torch.xpu.XPUGraph()
+        s0 = torch.xpu.Stream()
+        s1 = torch.xpu.Stream()
+        s0.wait_stream(torch.xpu.current_stream())
+        with torch.xpu.stream(s0):
+            g.capture_begin()
+            z = x + y
+        with torch.xpu.stream(s1):
+            s1.wait_stream(s0)
+            z + y
+        s0.wait_stream(s1)
+        with torch.xpu.stream(s0):
+            g.capture_end()
+        segments = torch.xpu.memory_snapshot()
+        x = [
+            s["segment_pool_id"]
+            for s in segments
+            if s["segment_pool_id"] not in existing_pools
+        ]
+        self.assertEqual(len(x), 2)
+        self.assertEqual(x[0], x[1])
+
+    @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
+    def test_xpu_graph_tensor_item_not_allowed(self):
+        test_script = """\
+import torch
+import sys
+# Tensor.item() calls a synchronize which is not allowed in a xpu graph
+def my_func(a: torch.Tensor, b: torch.Tensor, perm: torch.Tensor):
+    idx = perm[0]
+    a[0] *= b[idx]  # should raise an error during capture
+    return a
+
+a = torch.rand(500, 500, device="xpu")
+b = torch.rand(500, 500, device="xpu")
+perm = torch.randint(0, 500, (500,), device="xpu")
+
+g = torch.xpu.XPUGraph()
+
+with torch.xpu.graph(g):
+    output = my_func(a, b, perm)
+"""
+        with self.assertRaisesRegex(
+            subprocess.CalledProcessError,
+            "wait method cannot be used for an event associated with a command graph",
+        ):
+            r = (
+                subprocess.check_output([sys.executable, "-c", test_script])
+                .decode("ascii")
+                .strip()
+            )
+@contextlib.contextmanager
+def caching_host_allocator_use_host_register(use_xpu_host_register: bool):
+    if use_xpu_host_register:
+        torch._C._accelerator_setAllocatorSettings(
+            "pinned_use_xpu_host_register:True,pinned_num_register_threads:8"
+        )
+    try:
+        yield
+    finally:
+        if use_xpu_host_register:
+            torch._C._accelerator_setAllocatorSettings(
+                "pinned_use_xpu_host_register:False"
+            )
+
+@contextlib.contextmanager
+def caching_host_allocator_use_background_threads(use_background_threads: bool):
+    if use_background_threads:
+        torch._C._accelerator_setAllocatorSettings("pinned_use_background_threads:True")
+    try:
+        yield
+    finally:
+        if use_background_threads:
+            torch._C._accelerator_setAllocatorSettings(
+                "pinned_use_background_threads:False"
+            )
+@unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
+class TestCachingHostAllocatorXpuGraph(TestCase):
+    @parametrize("use_xpu_host_register", [True, False])
+    def test_pin_memory_no_use(self, use_xpu_host_register):
+        # A pinned host memory block cannot be reused if it is not deleted
+        with caching_host_allocator_use_host_register(use_xpu_host_register):
+            graph = torch.xpu.XPUGraph()
+            with torch.xpu.graph(graph):
+                data = torch.empty(8, pin_memory=True)
+                data2 = torch.empty(8, pin_memory=True)
+            assert data.data_ptr() != data2.data_ptr()
+            del data2
+
+    @parametrize("use_xpu_host_register", [True, False])
+    def test_pin_memory_no_use2(self, use_xpu_host_register):
+        # A pinned host memory block can be reused if it is deleted
+        # and has never been used by copy_
+        with caching_host_allocator_use_host_register(use_xpu_host_register):
+            graph = torch.xpu.XPUGraph()
+            with torch.xpu.graph(graph):
+                data = torch.randn(8).pin_memory()
+                data_ptr = data.data_ptr()
+                del data
+                data2 = torch.randn(8).pin_memory()
+                assert data2.data_ptr() == data_ptr
+
+    @parametrize("use_xpu_host_register", [True, False])
+    def test_pin_memory_use(self, use_xpu_host_register):
+        # A pinned host memory block cannot be reused if it has been used by copy_
+        with caching_host_allocator_use_host_register(use_xpu_host_register):
+            graph = torch.xpu.XPUGraph()
+            with torch.xpu.graph(graph):
+                data = torch.randn(8).pin_memory()
+                data_gpu = torch.randn(8, device="xpu")
+                data_gpu.copy_(data, non_blocking=True)
+                old_data_ptr = data.data_ptr()
+                del data
+                data2 = torch.randn(8).pin_memory()
+            assert data2.data_ptr() != old_data_ptr
+
+    @parametrize("use_xpu_host_register", [True, False])
+    @parametrize("use_background_threads", [True, False])
+    @parametrize(
+        "use_memory, delete_memory",
+        [(True, True), (True, False), (False, True), (False, False)],
+    )
+    def test_two_graphs(
+        self, use_background_threads, use_xpu_host_register, use_memory, delete_memory
+    ):
+        with (
+            caching_host_allocator_use_background_threads(use_background_threads),
+            caching_host_allocator_use_host_register(use_xpu_host_register),
+        ):
+            shared_pool = torch.xpu.graph_pool_handle()
+            graph1 = torch.xpu.XPUGraph()
+            graph2 = torch.xpu.XPUGraph()
+
+            with torch.xpu.graph(graph1, pool=shared_pool):
+                data = torch.randn(8).pin_memory()
+                if use_memory:
+                    data_gpu = torch.randn(8, device="xpu")
+                    data_gpu.copy_(data, non_blocking=True)
+
+                old_data_ptr = data.data_ptr()
+                if delete_memory:
+                    del data
+
+            with torch.xpu.graph(graph2, pool=shared_pool):
+                data2 = torch.randn(8).pin_memory()
+                if use_memory:
+                    data_gpu = torch.randn(8, device="xpu")
+                    data_gpu.copy_(data2, non_blocking=True)
+
+                new_data_ptr = data2.data_ptr()
+                if delete_memory:
+                    del data2
+
+            if delete_memory and not use_memory:
+                assert new_data_ptr == old_data_ptr
+            else:
+                assert new_data_ptr != old_data_ptr
+
+@unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
+@torch.testing._internal.common_utils.markDynamoStrictTest
+class TestXpuOptims(TestCase):
+    @optims(
+        [optim for optim in optim_db if optim.has_capturable_arg],
+        dtypes=[torch.float32],
+    )
+    def test_graph_optims(self, dtype, optim_info):
+        device = "xpu"
+        optim_cls = optim_info.optim_cls
+        all_optim_inputs = _get_optim_inputs_including_global_cliquey_kwargs(
+            device, dtype, optim_info, skip=("differentiable",)
+        )
+
+        steps_warmup = 3
+        steps_train = 2
+
+        for optim_input in all_optim_inputs:
+            kwargs = optim_input.kwargs
+
+            kwargs["lr"] = 0.1
+            if optim_cls in (torch.optim.Adam, torch.optim.AdamW):
+                kwargs["betas"] = (0.9, 0.99)
+
+            for actually_do_graphs in (True, False):
+                params = [
+                    torch.randn((i + 5, i + 5), device=device) for i in range(2)
+                ] + [torch.randn((), device=device)]
+                params_control = [p.clone().requires_grad_() for p in params]
+                params_graphed = [p.clone().requires_grad_() for p in params]
+
+                grads = [
+                    [torch.randn_like(p) for p in params]
+                    for _ in range(steps_warmup + steps_train)
+                ]
+
+                # capturable=False
+                kwargs["capturable"] = False
+
+                opt = optim_cls(params_control, **kwargs)
+                for i in range(steps_warmup + steps_train):
+                    for j, p in enumerate(params_control):
+                        p.grad = grads[i][j]
+                    opt.step()
+
+                # capturable=True
+                kwargs["capturable"] = True
+                opt = optim_cls(params_graphed, **kwargs)
+
+                for i in range(steps_warmup):
+                    for j, p in enumerate(params_graphed):
+                        p.grad = grads[i][j]
+                    opt.step()
+
+                if actually_do_graphs:
+                    g = torch.xpu.XPUGraph()
+                    with torch.xpu.graph(g):
+                        opt.step()
+
+                for i in range(steps_train):
+                    if actually_do_graphs:
+                        for j, p in enumerate(params_graphed):
+                            p.grad.copy_(grads[i + steps_warmup][j])
+                        g.replay()
+                    else:
+                        for j, p in enumerate(params_graphed):
+                            p.grad = grads[i + steps_warmup][j]
+                        opt.step()
+
+                for p_control, p_graphed in zip(params_control, params_graphed):
+                    self.assertEqual(p_control, p_graphed)
+
+    @optims(
+        [
+            optim
+            for optim in optim_db
+            if "fused" in optim.supported_impls and "xpu" in optim.supports_fused_on
+        ],
+        dtypes=[torch.float32],
+    )
+    def test_graph_scaling_fused_optimizers(self, dtype, optim_info):
+        device = "xpu"
+        optim_cls = optim_info.optim_cls
+
+        steps_warmup = 3
+        steps_train = 2
+
+        optim_inputs = optim_info.optim_inputs_func(device=device)
+
+        for optim_input in optim_inputs:
+            kwargs = optim_input.kwargs
+            kwargs["fused"] = True
+
+            for actually_do_graphs in (
+                (True, False) if optim_info.has_capturable_arg else (True,)
+            ):
+                params = [torch.randn((i + 5, i + 5), device=device) for i in range(2)]
+                params_control = [p.clone().requires_grad_() for p in params]
+                params_graphed = [p.clone().requires_grad_() for p in params]
+
+                # `GradScaler` in-place updates gradients thus it's necessary to duplicate gradients.
+                grads = [
+                    [torch.randn_like(p) for p in params]
+                    for _ in range(steps_warmup + steps_train)
+                ]
+                with torch.no_grad():
+                    grads_control = [[g.clone() for g in gs] for gs in grads]
+                    grads_graphed = [[g.clone() for g in gs] for gs in grads]
+
+                # Gradient Scaler
+                scaler_for_control = torch.amp.GradScaler("xpu", init_scale=128.0)
+                with torch.no_grad():
+                    scaler_for_control._lazy_init_scale_growth_tracker(device)
+
+                scaler_for_graphed = torch.amp.GradScaler("xpu")
+                scaler_for_graphed.load_state_dict(scaler_for_control.state_dict())
+                with torch.no_grad():
+                    scaler_for_graphed._lazy_init_scale_growth_tracker(device)
+
+                # capturable=False
+                if optim_info.has_capturable_arg:
+                    kwargs["capturable"] = False
+                opt = optim_cls(params_control, **kwargs)
+
+                for i in range(steps_warmup + steps_train):
+                    for j, p in enumerate(params_control):
+                        p.grad = grads_control[i][j]
+                    scaler_for_control.step(opt)
+                    scaler_for_control.update()
+
+                # capturable=True
+                if optim_info.has_capturable_arg:
+                    kwargs["capturable"] = True
+                opt = optim_cls(params_graphed, **kwargs)
+
+                for i in range(steps_warmup):
+                    for j, p in enumerate(params_graphed):
+                        p.grad = grads_graphed[i][j]
+                    scaler_for_graphed.step(opt)
+                    scaler_for_graphed.update()
+
+                if actually_do_graphs:
+                    g = torch.xpu.XPUGraph()
+                    with torch.xpu.graph(g):
+                        scaler_for_graphed.step(opt)
+                        scaler_for_graphed.update()
+
+                for i in range(steps_train):
+                    if actually_do_graphs:
+                        for j, p in enumerate(params_graphed):
+                            p.grad.copy_(grads_graphed[i + steps_warmup][j])
+                        g.replay()
+                    else:
+                        for j, p in enumerate(params_graphed):
+                            p.grad = grads_graphed[i + steps_warmup][j]
+                        scaler_for_graphed.step(opt)
+                        scaler_for_graphed.update()
+
+                for p_control, p_graphed in zip(params_control, params_graphed):
+                    self.assertEqual(p_control, p_graphed)
+
+    @parametrize("foreach, fused", [(False, False), (True, False), (False, True)])
+    @optims(
+        [
+            optim
+            for optim in optim_db
+            if "foreach" in optim.supported_impls and "cuda" in optim.supports_fused_on
+        ],
+        dtypes=[torch.float32],
+    )
+    def test_graph_grad_scaling(self, dtype, optim_info, foreach, fused):
+        device = "xpu"
+        torch.cuda.empty_cache()
+
+        scaler = torch.amp.GradScaler(device="xpu", init_scale=4.0)
+        g = torch.xpu.XPUGraph()
+        s = torch.xpu.Stream()
+
+        weight = torch.ones((100,), device="xpu", requires_grad=True)
+        opt = optim_info.optim_cls([weight], lr=0.1, foreach=foreach, fused=fused)
+        static_input = torch.ones_like(weight)
+        static_grad = torch.ones_like(weight)
+
+        # warmup
+        s = torch.xpu.Stream()
+        s.wait_stream(torch.xpu.current_stream())
+        with torch.xpu.stream(s):
+            loss = (weight.half() * static_input).sum()
+            scaler.scale(loss).backward()
+        torch.xpu.current_stream().wait_stream(s)
+
+        opt.zero_grad(set_to_none=True)
+
+        # capture
+        with torch.xpu.stream(s):
+            g.capture_begin()
+            loss = (weight.half() * static_input).sum()
+            scaler.scale(loss).backward()
+            g.capture_end()
+
+        input_vals = [5, 20000, 5, 40000]
+        expected_scales = [4, 2, 2, 1]
+        expected_growth_trackers = [1, 0, 1, 0]
+        expected_grad_vals = [5 * 4, float("inf"), 5 * 2, float("inf")]
+
+        for data, scale, growth_tracker, grad_val in zip(
+            input_vals, expected_scales, expected_growth_trackers, expected_grad_vals
+        ):
+            static_input.fill_(data)
+            g.replay()
+            self.assertEqual(weight.grad, torch.full_like(weight.grad, grad_val))
+            scaler.step(opt)
+            scaler.update()
+            self.assertEqual(scaler._scale, scale)
+            self.assertEqual(scaler._growth_tracker, growth_tracker)
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestXpuOps(TestCase):
@@ -2635,7 +3148,8 @@ class TestMemPool(TestCase):
 
 
 instantiate_parametrized_tests(TestXpu)
-
+instantiate_parametrized_tests(TestCachingHostAllocatorXpuGraph)
+instantiate_device_type_tests(TestXpuOptims, globals())
 
 if __name__ == "__main__":
     run_tests()
