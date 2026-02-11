@@ -100,12 +100,12 @@ void XPUGraph::capture_end() {
        captured_generator_states_) {
     wholegraph_increments = generator_state->capture_epilogue();
   }
-
-  size_t numXPUGraphNodes = graph_->get_nodes().size();
-  if (numXPUGraphNodes == 0) {
+#if defined(__clang__) && (__clang_major__ >= 22)
+  if (graph_->empty()) {
       TORCH_WARN("The XPU Graph is empty. This usually means that the graph was ",
                  "attempted to be captured on wrong device or stream.");
   }
+#endif
 
   capture_ended_ = true;
   has_graph_ = true;
